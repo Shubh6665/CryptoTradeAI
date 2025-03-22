@@ -276,72 +276,80 @@ class LiveTrader:
         logger.info("⏹️ Stopping live trading...")
         self.is_trading_active = False
     
-    def _trading_loop(self):
-        """Main trading loop"""
-        while self.is_trading_active:
-            try:
-                # Get latest market data
-                self.latest_market_data, market_data_df = get_live_market_data(self.client, self.symbol)
-                current_price = self.latest_market_data['current_price']
+def _trading_loop(self):
+    """
+    Main trading loop that automatically checks market data,
+    gets model predictions, evaluates risk management, and executes trades.
+    """
+    while self.is_trading_active:
+        try:
+            # 1. Update market data
+            self.latest_market_data, market_data_df = get_live_market_data(self.client, self.symbol)
+            if not self.latest_market_data or 'current_price' not in self.latest_market_data:
+                logger.error("Market data unavailable; skipping iteration.")
+                time.sleep(10)
+                continue
+            current_price = self.latest_market_data['current_price']
+            
+            # 2. Update portfolio value and history
+            self.current_portfolio_value = self.calculate_portfolio_value()
+            self.portfolio_history.append(self.current_portfolio_value)
+            
+            # 3. Update risk metrics
+            self.risk_manager.update_metrics(self.current_portfolio_value)
+            
+            # 4. Check risk management triggers (e.g., stop-loss or take-profit)
+            action_type, amount = self.check_risk_management_triggers(current_price)
+            if action_type != 0 and amount > 0:
+                logger.info("Risk trigger activated; executing risk-based trade.")
+                self.execute_trade(action_type, amount)
+                self.last_action_time = datetime.now()
+            else:
+                # 5. Preprocess observation for the model
+                observation = self.preprocess_observation(market_data_df)
+                self.latest_observation = observation
                 
-                # Update portfolio value
-                self.current_portfolio_value = self.calculate_portfolio_value()
-                self.portfolio_history.append(self.current_portfolio_value)
+                # 6. Get model prediction
+                model_action, _ = self.model.predict(observation, deterministic=True)
+                self.latest_action = model_action
                 
-                # Update risk manager metrics
-                self.risk_manager.update_metrics(self.current_portfolio_value)
-                
-                # Check risk management triggers first
-                action_type, amount = self.check_risk_management_triggers(current_price)
-                
-                if action_type != 0 and amount > 0:
-                    # Execute risk-based trade
-                    self.execute_trade(action_type, amount)
+                # Interpret model action value (e.g., >0.2: BUY, < -0.2: SELL, else HOLD)
+                action_value = model_action[0]
+                if action_value > 0.2:
+                    signal = "BUY"
+                elif action_value < -0.2:
+                    signal = "SELL"
                 else:
-                    # Prepare observation for model
-                    observation = self.preprocess_observation(market_data_df)
-                    self.latest_observation = observation
-                    
-                    # Get model prediction
-                    action, _ = self.model.predict(observation, deterministic=True)
-                    self.latest_action = action
-                    
-                    # Log prediction
-                    action_value = action[0]
-                    signal = "BUY" if action_value > 0.2 else "SELL" if action_value < -0.2 else "HOLD"
-                    logger.info(f"📊 Model prediction: {signal} ({action_value:.4f}) at price ${current_price:.2f}")
-                    
-                    # Check if we're allowed to trade now (time-based throttling)
-                    can_trade = (
-                        self.last_action_time is None or 
-                        (datetime.now() - self.last_action_time).total_seconds() >= self.min_time_between_trades
+                    signal = "HOLD"
+                logger.info(f"Model prediction: {signal} ({action_value:.4f}) at price ${current_price:.2f}")
+                
+                # 7. Check if enough time has passed since last action
+                can_trade = (
+                    self.last_action_time is None or 
+                    (datetime.now() - self.last_action_time).total_seconds() >= self.min_time_between_trades
+                )
+                
+                if can_trade and signal != "HOLD":
+                    # Calculate trade size via risk manager
+                    adjusted_action, trade_amount = self.risk_manager.calculate_position_size(
+                        model_action, self.current_portfolio_value, current_price
                     )
                     
-                    if can_trade:
-                        # Calculate position size through risk manager
-                        adjusted_action, trade_amount = self.risk_manager.calculate_position_size(
-                            action, 
-                            self.current_portfolio_value, 
-                            current_price
-                        )
-                        
-                        if adjusted_action != 0 and trade_amount > 0:
-                            # Execute the trade
-                            trade_result = self.execute_trade(adjusted_action, trade_amount)
-                            
-                            if trade_result:
-                                self.last_action_time = datetime.now()
-                
-                # Dynamically adjust risk parameters
-                risk_metrics = self.risk_manager.get_risk_metrics()
-                self.risk_manager.adjust_thresholds(risk_metrics)
-                
-                # Sleep before next iteration
-                time.sleep(10)  # Check every 10 seconds
-                
-            except Exception as e:
-                logger.error(f"❌ Error in trading loop: {str(e)}")
-                time.sleep(30)  # Wait longer on error
+                    if adjusted_action != 0 and trade_amount > 0:
+                        result = self.execute_trade(adjusted_action, trade_amount)
+                        if result:
+                            self.last_action_time = datetime.now()
+            
+            # 8. Optionally, dynamically adjust risk parameters
+            risk_metrics = self.risk_manager.get_risk_metrics()
+            self.risk_manager.adjust_thresholds(risk_metrics)
+            
+            # 9. Sleep before next iteration
+            time.sleep(10)  # Check every 10 seconds; adjust as needed
+            
+        except Exception as e:
+            logger.error(f"❌ Error in trading loop: {str(e)}")
+            time.sleep(30)  # Wait longer on error
     
     def get_trading_status(self):
         """
